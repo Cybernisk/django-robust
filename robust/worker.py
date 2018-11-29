@@ -3,106 +3,99 @@ import select
 import signal
 import threading
 import time
-from typing import Any, List, Optional, Union
+from queue import Queue
+from typing import Any, List, Union
 
 from django.conf import settings
-# noinspection PyProtectedMember
-from django.db import close_old_connections, connection, transaction
+from django.db import (
+    DEFAULT_DB_ALIAS, connection,
+    connections, transaction,
+)
+from django.db.backends.postgresql.base import DatabaseWrapper
 
 from .beat import BeatThread, get_scheduler
 from .models import Task
 
 logger = logging.getLogger(__name__)
 
-
-class Stop(Exception):
-    pass
+stop_worker = object()
 
 
-class WorkerLimit:
-    def __init__(self, limit: int) -> None:
-        self.lock = threading.Lock()
-        self.limit = limit
+def detach_connection() -> DatabaseWrapper:
+    res = connections[DEFAULT_DB_ALIAS]
+    res.allow_thread_sharing = True
+    del connections[DEFAULT_DB_ALIAS]
+    return res
 
-    def dec(self, amount: int) -> None:
-        with self.lock:
-            self.limit -= amount
 
-    def should_terminate(self) -> bool:
-        with self.lock:
-            return self.limit <= 0
+def attach_connection(conn: DatabaseWrapper) -> None:
+    connections[DEFAULT_DB_ALIAS] = conn
 
 
 class WorkerThread(threading.Thread):
-    def __init__(self, number: int, runner_cls: type, bulk: int,
-                 worker_limit: Optional[WorkerLimit]) -> None:
+    def __init__(self, task_queue: Queue, number: int,
+                 runner_cls: type) -> None:
         super(WorkerThread, self).__init__(
             name='WorkerThread-{}'.format(number))
+        self.task_queue = task_queue
         self.runner_cls = runner_cls
-        self.bulk = bulk
-        self.worker_limit = worker_limit
-        self.terminate = False
-
-    def should_terminate(self) -> bool:
-        if self.terminate:
-            return True
-        if self.worker_limit:
-            if self.worker_limit.should_terminate():
-                return True
-        return False
 
     def run(self) -> None:
-        try:
-            notify_timeout = getattr(settings, 'ROBUST_NOTIFY_TIMEOUT', 10)
-            worker_failure_timeout = getattr(
-                settings, 'ROBUST_WORKER_FAILURE_TIMEOUT', 5)
+        worker_failure_timeout = getattr(
+            settings, 'ROBUST_WORKER_FAILURE_TIMEOUT', 5)
 
-            while True:
-                try:
-                    if self.should_terminate():
-                        raise Stop()
+        while True:
+            # noinspection PyBroadException
+            try:
+                tasks, detached_connection = self.task_queue.get()
 
-                    with transaction.atomic():
-                        tasks = Task.objects.next(limit=self.bulk)
-                        logger.debug('%s got tasks %r', self.name, tasks)
-                        if self.worker_limit:
-                            self.worker_limit.dec(amount=len(tasks))
-
-                        for task in tasks:
-                            runner = self.runner_cls(task)
-                            runner.run()
-
-                    if self.should_terminate():
-                        raise Stop()
-
-                    if not tasks:
-                        with connection.cursor() as cursor:
-                            cursor.execute('LISTEN robust')
-
-                        logger.debug('listen for postgres events')
-                        select.select([connection.connection], [], [],
-                                      notify_timeout)
-
-                except Stop:
+                if tasks is stop_worker:
+                    self.task_queue.task_done()
                     break
 
-                except Exception:
-                    logger.error('%s exception ', self.name, exc_info=True)
-                    time.sleep(worker_failure_timeout)
+                try:
+                    attach_connection(detached_connection)
 
-            logger.debug('terminating %s', self.name)
-        finally:
-            close_old_connections()
+                    logger.debug('%s got tasks %r', self.name, tasks)
+
+                    for task in tasks:
+                        runner = self.runner_cls(task)
+                        runner.run()
+                    transaction.commit()
+
+                except Exception:
+                    transaction.rollback()
+                    raise
+
+                finally:
+                    self.task_queue.task_done()
+                    connections.close_all()
+
+            except Exception:
+                logger.error('%s exception ', self.name, exc_info=True)
+                time.sleep(worker_failure_timeout)
+
+        connections.close_all()
+        logger.debug('terminated %s', self.name)
+
+
+def terminate_notify() -> None:
+    with connection.cursor() as cursor:
+        logger.warning('terminate notify')
+        cursor.execute('NOTIFY robust')
 
 
 def run_worker(concurrency: int, bulk: int, limit: int, runner_cls: type,
                beat: bool) -> None:
-    worker_limit = None
-    if limit:
-        worker_limit = WorkerLimit(limit)
+    notify_timeout = getattr(settings, 'ROBUST_NOTIFY_TIMEOUT', 10)
+
+    task_queue: Queue = Queue(maxsize=concurrency)
 
     threads: List[Union[BeatThread, WorkerThread]] = []
 
+    listen_connection = detach_connection()
+
+    beat_thread = None
     if beat:
         scheduler = get_scheduler()
         beat_thread = BeatThread(scheduler)
@@ -110,29 +103,65 @@ def run_worker(concurrency: int, bulk: int, limit: int, runner_cls: type,
         beat_thread.start()
 
     for number in range(concurrency):
-        worker_thread = WorkerThread(number, runner_cls, bulk, worker_limit)
+        worker_thread = WorkerThread(task_queue, number, runner_cls)
         threads.append(worker_thread)
         worker_thread.start()
 
-    def terminate() -> None:
-        for t in threads:
-            t.terminate = True
-        with connection.cursor() as cursor:
-            cursor.execute('NOTIFY robust')
+    should_terminate = []
 
     def signal_handler(*_: Any) -> None:
         logger.warning('terminate worker')
-        terminate()
+        should_terminate.append(True)
+        terminate_notify()
 
     signal.signal(signal.SIGINT, signal_handler)
 
     while True:
-        for thread in threads:
-            if thread.is_alive():
-                break
-        else:
+        logger.debug('poll')
+
+        if should_terminate:
+            if beat_thread is not None:
+                beat_thread.terminate = True
+            for i in range(concurrency):
+                task_queue.put((stop_worker, None))
             break
-        time.sleep(1)
-        if worker_limit:
-            if worker_limit.should_terminate():
-                terminate()
+
+        if transaction.get_autocommit():
+            transaction.set_autocommit(False)
+
+        tasks = Task.objects.next(limit=bulk)
+
+        if not tasks:
+            with listen_connection.cursor() as cursor:
+                cursor.execute('LISTEN robust')
+
+            logger.debug('listen for postgres events')
+            if select.select([listen_connection.connection], [], [],
+                             notify_timeout) == ([], [], []):
+                logger.debug('listen for postgres events timeout')
+            else:
+                listen_connection.connection.poll()
+                while listen_connection.connection.notifies:
+                    listen_connection.connection.notifies.pop()
+                logger.debug('listen for postgres events got notify')
+
+            continue
+
+        detached_connection = detach_connection()
+        task_queue.put((tasks, detached_connection))
+
+        if limit is not None:
+            limit -= len(tasks)
+            if limit <= 0:
+                logger.warning('terminate worker due to limit')
+                should_terminate.append(True)
+
+    logger.debug('join task queue')
+    task_queue.join()
+
+    for thread in threads:
+        logger.debug('join worker %r', thread)
+        thread.join()
+
+    connection.close()
+    listen_connection.close()

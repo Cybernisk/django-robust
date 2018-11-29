@@ -22,6 +22,7 @@ undefined = object()
 
 
 class SimpleRunner(Runner):
+    # noinspection PyMethodMayBeStatic
     def call(self, fn: Callable[..., Any], kwargs: dict) -> None:
         """
         call task function, override in subclasses for custom signals etc

@@ -17,7 +17,7 @@ setup(
     python_requires='>=3.6',
     install_requires=[
         'django >= 1.11',
-        'psycopg2 >= 2.5',
+        'psycopg2-binary >= 2.7.6.1',
         'django-redis >= 4.8.0',
         'redis >= 2.10',
         'django-object-actions',

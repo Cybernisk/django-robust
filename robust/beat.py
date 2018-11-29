@@ -34,9 +34,10 @@ def get_scheduler() -> Scheduler:
             # noinspection PyUnresolvedReferences
             scheduler.every(int(interval.total_seconds())) \
                 .seconds.do(schedule_task, task, task_cls.tags)
-        else:
+        elif callable(interval):
             interval(scheduler).do(schedule_task, task, task_cls.tags)
-
+        else:
+            raise RuntimeError(f'{interval!r} isnt supported schedule')
     return scheduler
 
 

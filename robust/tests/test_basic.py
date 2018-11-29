@@ -12,18 +12,21 @@ import django.db
 from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.db.transaction import TransactionManagementError
-from django.test import TransactionTestCase, override_settings
+from django.test import TransactionTestCase, SimpleTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from django_redis.cache import RedisCache
 from redis import StrictRedis
+from django.db import connection
 
 import robust
 from robust import signals
 from robust.admin import TaskEventsFilter
 from robust.exceptions import Retry, TaskTransactionError
-from robust.models import PayloadProcessor, TaskWrapper, cleanup, task, \
-    save_tag_run
+from robust.models import (
+    PayloadProcessor, TaskWrapper, cleanup, task,
+    save_tag_run, calc_tags_eta,
+)
 from robust.models import Task, TaskEvent
 from robust.runners import SimpleRunner
 
@@ -244,8 +247,25 @@ def worker_test_fn(desired_status: int) -> None:
 TEST_WORKER_TASK_PATH = import_path(worker_test_fn)
 
 
-class WorkerTest(TransactionTestCase):
+@override_settings(ROBUST_NOTIFY_TIMEOUT=1)
+class WorkerTest(SimpleTestCase):
+    allow_database_queries = True
+
+    def setUp(self) -> None:
+        self._truncate()
+
+    def tearDown(self) -> None:
+        self._truncate()
+
+    @staticmethod
+    def _truncate() -> None:
+        with connection.cursor() as cursor:
+            cursor.execute('TRUNCATE TABLE robust_task CASCADE')
+        django.db.close_old_connections()
+
     def test_simple(self) -> None:
+        self.assertFalse(Task.objects.exists())
+
         Task.objects.create(name=TEST_WORKER_TASK_PATH,
                             payload={'desired_status': Task.SUCCEED})
         Task.objects.create(name=TEST_WORKER_TASK_PATH,
@@ -259,6 +279,8 @@ class WorkerTest(TransactionTestCase):
             self.assertSequenceEqual(Task.objects.next(limit=10), [t3])
 
     def test_bulk(self) -> None:
+        self.assertFalse(Task.objects.exists())
+
         for idx in range(100):
             status = Task.SUCCEED if idx % 2 else Task.FAILED
             Task.objects.create(name=TEST_WORKER_TASK_PATH,
@@ -386,7 +408,7 @@ class RateLimitTest(TransactionTestCase):
             runtime = timezone.now().replace(microsecond=0)
             t1 = Task.objects.create(name=TEST_TASK_PATH, tags=['foo', 'bar'])
             t2 = Task.objects.create(name=TEST_TASK_PATH, tags=['bar', 'spam'])
-            Task.objects.create(name=TEST_TASK_PATH, tags=['foo', 'eggs'])
+            t3 = Task.objects.create(name=TEST_TASK_PATH, tags=['foo', 'eggs'])
             save_tag_run('foo', runtime)
             save_tag_run('bar', runtime)
             save_tag_run('bar', runtime)
@@ -394,6 +416,11 @@ class RateLimitTest(TransactionTestCase):
 
         with django.db.transaction.atomic():
             self.assertSequenceEqual(Task.objects.next(limit=10), [t1, t2])
+            self.assertSequenceEqual(
+                Task.objects.next(limit=10,
+                                  eta=runtime + timedelta(seconds=61)),
+                [t1, t2, t3]
+            )
 
 
 @task()

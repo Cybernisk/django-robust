@@ -120,7 +120,7 @@ LOGGING = {
             'level': 'DEBUG'
         },
         'robust.worker': {
-            'level': 'CRITICAL'
+            'level': 'DEBUG'
         },
         'schedule': {
             'level': 'INFO'

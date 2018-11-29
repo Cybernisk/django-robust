@@ -11,7 +11,7 @@ from django.conf import settings
 from django.contrib.postgres.fields import ArrayField, JSONField
 # noinspection PyProtectedMember
 from django.core.cache import caches
-from django.db import connection, models
+from django.db import connection, models, transaction
 from django.utils import timezone
 from django.utils.module_loading import import_string
 from django_redis.cache import RedisCache
@@ -31,8 +31,9 @@ class TaskQuerySet(models.QuerySet):
         return cast(TaskQuerySet, qs)
 
     def next(self, limit: int = 1,
-             eta: Optional[datetime] = None) -> List['Task']:
-        if not connection.in_atomic_block:
+             eta: Optional[datetime] = None,
+             without_tasks: Optional[List[int]] = None) -> List['Task']:
+        if transaction.get_autocommit():
             raise TaskTransactionError('Task.objects.next() must be used '
                                        'inside transaction')
 
@@ -46,10 +47,16 @@ class TaskQuerySet(models.QuerySet):
             .filter(status_cond & eta_cond) \
             .order_by('pk')
 
+        if without_tasks:
+            qs = qs.exclude(pk__in=without_tasks)
+        else:
+            without_tasks = []
+
         tasks = list(qs[:limit])
 
         allowed_tasks: List[Task] = []
 
+        removed = False
         for t in tasks:
             tags_eta = calc_tags_eta(t.tags)
             if tags_eta:
@@ -57,8 +64,15 @@ class TaskQuerySet(models.QuerySet):
                 if max_eta >= cast(datetime, eta):
                     t.eta = max_eta
                     t.save(update_fields={'eta'})
+                    removed = True
                     continue
             allowed_tasks.append(t)
+
+        if removed:
+            remaining = limit - len(allowed_tasks)
+            if remaining:
+                without_tasks.extend([x.pk for x in allowed_tasks])
+                allowed_tasks.extend(self.next(remaining, eta, without_tasks))
 
         return allowed_tasks
 
@@ -91,7 +105,8 @@ class Task(models.Model):
 
     objects = TaskQuerySet.as_manager()
 
-    def _format_traceback(self) -> Optional[str]:
+    @staticmethod
+    def _format_traceback() -> Optional[str]:
         etype, value, tb = sys.exc_info()
         try:
             if etype and value and tb:
